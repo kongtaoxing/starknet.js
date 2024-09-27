@@ -5,20 +5,30 @@ import {
   AbiStructs,
   Args,
   BigNumberish,
+  ByteArray,
   CairoEnum,
   EventEntry,
   ParsedStruct,
 } from '../../types';
-import { uint256ToBN } from '../uint256';
+import { CairoUint256 } from '../cairoDataTypes/uint256';
+import { CairoUint512 } from '../cairoDataTypes/uint512';
+import { addHexPrefix, removeHexPrefix } from '../encode';
+import { toHex } from '../num';
+import { decodeShortString } from '../shortString';
+import { stringFromByteArray } from './byteArray';
 import {
   getArrayType,
   isCairo1Type,
   isLen,
   isTypeArray,
   isTypeBool,
+  isTypeByteArray,
+  isTypeBytes31,
   isTypeEnum,
+  isTypeEthAddress,
+  isTypeNonZero,
+  isTypeSecp256k1Point,
   isTypeTuple,
-  isTypeUint256,
 } from './cairo';
 import {
   CairoCustomEnum,
@@ -42,13 +52,29 @@ function parseBaseTypes(type: string, it: Iterator<string>) {
     case isTypeBool(type):
       temp = it.next().value;
       return Boolean(BigInt(temp));
-    case isTypeUint256(type):
+    case CairoUint256.isAbiType(type):
       const low = it.next().value;
       const high = it.next().value;
-      return uint256ToBN({ low, high });
-    case type === 'core::starknet::eth_address::EthAddress':
+      return new CairoUint256(low, high).toBigInt();
+    case CairoUint512.isAbiType(type):
+      const limb0 = it.next().value;
+      const limb1 = it.next().value;
+      const limb2 = it.next().value;
+      const limb3 = it.next().value;
+      return new CairoUint512(limb0, limb1, limb2, limb3).toBigInt();
+    case isTypeEthAddress(type):
       temp = it.next().value;
       return BigInt(temp);
+    case isTypeBytes31(type):
+      temp = it.next().value;
+      return decodeShortString(temp);
+    case isTypeSecp256k1Point(type):
+      const xLow = removeHexPrefix(it.next().value).padStart(32, '0');
+      const xHigh = removeHexPrefix(it.next().value).padStart(32, '0');
+      const yLow = removeHexPrefix(it.next().value).padStart(32, '0');
+      const yHigh = removeHexPrefix(it.next().value).padStart(32, '0');
+      const pubK = BigInt(addHexPrefix(xHigh + xLow + yHigh + yLow));
+      return pubK;
     default:
       temp = it.next().value;
       return BigInt(temp);
@@ -61,6 +87,7 @@ function parseBaseTypes(type: string, it: Iterator<string>) {
  * @param responseIterator - iterator of the response
  * @param element - element of the field {name: string, type: string}
  * @param structs - structs from abi
+ * @param enums
  * @return {any} - parsed arguments in format that contract is expecting
  */
 function parseResponseValue(
@@ -73,10 +100,34 @@ function parseResponseValue(
     return {};
   }
   // type uint256 struct (c1v2)
-  if (isTypeUint256(element.type)) {
+  if (CairoUint256.isAbiType(element.type)) {
     const low = responseIterator.next().value;
     const high = responseIterator.next().value;
-    return uint256ToBN({ low, high });
+    return new CairoUint256(low, high).toBigInt();
+  }
+  // type uint512 struct
+  if (CairoUint512.isAbiType(element.type)) {
+    const limb0 = responseIterator.next().value;
+    const limb1 = responseIterator.next().value;
+    const limb2 = responseIterator.next().value;
+    const limb3 = responseIterator.next().value;
+    return new CairoUint512(limb0, limb1, limb2, limb3).toBigInt();
+  }
+  // type C1 ByteArray struct, representing a LongString
+  if (isTypeByteArray(element.type)) {
+    const parsedBytes31Arr: BigNumberish[] = [];
+    const bytes31ArrLen = BigInt(responseIterator.next().value);
+    while (parsedBytes31Arr.length < bytes31ArrLen) {
+      parsedBytes31Arr.push(toHex(responseIterator.next().value));
+    }
+    const pending_word = toHex(responseIterator.next().value);
+    const pending_word_len = BigInt(responseIterator.next().value);
+    const myByteArray: ByteArray = {
+      data: parsedBytes31Arr,
+      pending_word,
+      pending_word_len,
+    };
+    return stringFromByteArray(myByteArray);
   }
 
   // type c1 array
@@ -91,9 +142,18 @@ function parseResponseValue(
     return parsedDataArr;
   }
 
+  // type NonZero
+  if (isTypeNonZero(element.type)) {
+    // eslint-disable-next-line no-case-declarations
+    // const parsedDataArr: (BigNumberish | ParsedStruct | boolean | any[] | CairoEnum)[] = [];
+    const el: AbiEntry = { name: '', type: getArrayType(element.type) };
+    // parsedDataArr.push();
+    return parseResponseValue(responseIterator, el, structs, enums);
+  }
+
   // type struct
   if (structs && element.type in structs && structs[element.type]) {
-    if (element.type === 'core::starknet::eth_address::EthAddress') {
+    if (isTypeEthAddress(element.type)) {
       return parseBaseTypes(element.type, responseIterator);
     }
     return structs[element.type].members.reduce((acc, el) => {
@@ -218,6 +278,9 @@ export default function responseParser(
         }
       }
       return parsedDataArr;
+
+    case isTypeNonZero(type):
+      return parseResponseValue(responseIterator, output, structs, enums);
 
     default:
       return parseBaseTypes(type, responseIterator);

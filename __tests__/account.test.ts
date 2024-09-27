@@ -1,36 +1,36 @@
-import typedDataExample from '../__mocks__/typedDataExample.json';
+import typedDataExample from '../__mocks__/typedData/baseExample.json';
 import {
   Account,
+  AllowArray,
+  Call,
   Contract,
   DeclareDeployUDCResponse,
-  DeployTransactionReceiptResponse,
   Provider,
   TransactionType,
   cairo,
+  constants,
   contractClassResponseToLegacyCompiledContract,
   ec,
+  events,
   extractContractHashes,
   hash,
   num,
-  parseUDCEvent,
   shortString,
   stark,
 } from '../src';
 import {
+  TEST_TX_VERSION,
   compiledErc20,
   compiledHelloSierra,
   compiledHelloSierraCasm,
-  compiledNamingContract,
   compiledOpenZeppelinAccount,
-  compiledStarknetId,
   compiledTestDapp,
   describeIfDevnet,
-  describeIfDevnetSequencer,
   erc20ClassHash,
   getTestAccount,
   getTestProvider,
-} from './fixtures';
-import { initializeMatcher } from './schema';
+} from './config/fixtures';
+import { initializeMatcher } from './config/schema';
 
 const { cleanHex, hexToDecimalString, toBigInt, toHex } = num;
 const { encodeShortString } = shortString;
@@ -88,22 +88,31 @@ describe('deploy and test Wallet', () => {
 
   test('estimateInvokeFee Cairo 0', async () => {
     const innerInvokeEstFeeSpy = jest.spyOn(account.signer, 'signTransaction');
-    const result = await account.estimateInvokeFee({
+
+    const calls: AllowArray<Call> = {
       contractAddress: erc20Address,
       entrypoint: 'transfer',
       calldata: [erc20.address, '10', '0'],
-    });
+    };
 
+    let result = await account.estimateInvokeFee(calls, { skipValidate: true });
     expect(result).toMatchSchemaRef('EstimateFee');
-    expect(innerInvokeEstFeeSpy.mock.calls[0][1].version).toBe(hash.feeTransactionVersion);
+    expect(innerInvokeEstFeeSpy).not.toHaveBeenCalled();
     innerInvokeEstFeeSpy.mockClear();
+
+    result = await account.estimateInvokeFee(calls, { skipValidate: false });
+    expect(result).toMatchSchemaRef('EstimateFee');
+    expect([constants.TRANSACTION_VERSION.F1, constants.TRANSACTION_VERSION.F3]).toContain(
+      innerInvokeEstFeeSpy.mock.calls[0][1].version
+    );
+    innerInvokeEstFeeSpy.mockRestore();
   });
 
   xtest('estimateDeclareFee Cairo 0 &  Cairo 1', async () => {
     // this is tested indirectly true declareAndDeploy while declaring
   });
 
-  describeIfDevnetSequencer('Test on Devnet Sequencer', () => {
+  describeIfDevnet('Test on Devnet', () => {
     test('deployAccount with rawArgs - test on devnet', async () => {
       const priKey = stark.randomAddress();
       const pubKey = ec.starkCurve.getStarkKey(priKey);
@@ -111,11 +120,10 @@ describe('deploy and test Wallet', () => {
       const calldata = { publicKey: pubKey };
 
       // declare account
-      const declareAccount = await account.declare({
+      const declareAccount = await account.declareIfNot({
         contract: compiledOpenZeppelinAccount,
       });
       const accountClassHash = declareAccount.class_hash;
-      await account.waitForTransaction(declareAccount.transaction_hash);
 
       // fund new account
       const tobeAccountAddress = hash.calculateContractAddressFromHash(
@@ -137,7 +145,13 @@ describe('deploy and test Wallet', () => {
       await account.waitForTransaction(transaction_hash);
 
       // deploy account
-      const accountOZ = new Account(provider, tobeAccountAddress, priKey);
+      const accountOZ = new Account(
+        provider,
+        tobeAccountAddress,
+        priKey,
+        undefined,
+        TEST_TX_VERSION
+      );
       const deployed = await accountOZ.deploySelf({
         classHash: accountClassHash,
         constructorCalldata: calldata,
@@ -178,8 +192,10 @@ describe('deploy and test Wallet', () => {
   });
 
   describe('simulate transaction - single transaction S0.11.2', () => {
+    test('simulate empty invocations', async () => {
+      await expect(account.simulateTransaction([])).rejects.toThrow(TypeError);
+    });
     test('simulate INVOKE Cairo 0', async () => {
-      // INFO: Sequencer S0.11.2 support only one transaction per simulate request
       const res = await account.simulateTransaction([
         {
           type: TransactionType.INVOKE,
@@ -190,7 +206,6 @@ describe('deploy and test Wallet', () => {
             amount: uint256(10),
           },
         },
-        // This transaction will be skipped on sequencer
         {
           type: TransactionType.INVOKE,
           contractAddress: erc20Address,
@@ -232,37 +247,30 @@ describe('deploy and test Wallet', () => {
 
     describeIfDevnet('declare tests only on devnet', () => {
       test('simulate DECLARE - Cairo 0 Contract', async () => {
-        const res = await account.simulateTransaction([
+        const invocation = await provider.prepareInvocations([
           {
             type: TransactionType.DECLARE,
             contract: compiledErc20,
           },
         ]);
-        expect(res).toMatchSchemaRef('SimulateTransactionResponse');
+        if (invocation.length) {
+          const res = await account.simulateTransaction(invocation);
+          expect(res).toMatchSchemaRef('SimulateTransactionResponse');
+        }
       });
     });
 
     test('simulate DECLARE - Cairo 1 Contract - test if not already declared', async () => {
-      const declareContractPayload = extractContractHashes({
-        contract: compiledHelloSierra,
-        casm: compiledHelloSierraCasm,
-      });
-      let skip = false;
-      try {
-        await account.getClassByHash(declareContractPayload.classHash);
-        skip = true;
-      } catch (error) {
-        /* empty */
-      }
+      const invocation = await provider.prepareInvocations([
+        {
+          type: TransactionType.DECLARE,
+          contract: compiledHelloSierra,
+          casm: compiledHelloSierraCasm,
+        },
+      ]);
 
-      if (!skip) {
-        const res = await account.simulateTransaction([
-          {
-            type: TransactionType.DECLARE,
-            contract: compiledHelloSierra,
-            casm: compiledHelloSierraCasm,
-          },
-        ]);
+      if (invocation.length) {
+        const res = await account.simulateTransaction(invocation);
         expect(res).toMatchSchemaRef('SimulateTransactionResponse');
       }
     });
@@ -354,6 +362,22 @@ describe('deploy and test Wallet', () => {
     expect(balance.low).toStrictEqual(toBigInt(990));
   });
 
+  test('execute with and without deprecated abis parameter', async () => {
+    const transaction = {
+      contractAddress: erc20Address,
+      entrypoint: 'transfer',
+      calldata: [erc20.address, '10', '0'],
+    };
+    const details = { maxFee: 0n };
+
+    await expect(account.execute(transaction, details)).rejects.toThrow(
+      /zero|Transaction must commit to pay a positive amount on fee./
+    );
+    await expect(account.execute(transaction, undefined, details)).rejects.toThrow(
+      /zero|Transaction must commit to pay a positive amount on fee./
+    );
+  });
+
   test('execute with custom nonce', async () => {
     const result = await account.getNonce();
     const nonce = toBigInt(result);
@@ -390,23 +414,44 @@ describe('deploy and test Wallet', () => {
     expect(toBigInt(response.number as string).toString()).toStrictEqual('57');
   });
 
-  test('sign and verify offchain message fail', async () => {
-    const signature = await account.signMessage(typedDataExample);
-    const [r, s] = stark.formatSignature(signature);
+  describeIfDevnet('EIP712 verification', () => {
+    // currently only in Devnet-rs, because can fail in Sepolia.
+    // to test in all cases once PR#989 implemented.
+    test('sign and verify EIP712 message fail', async () => {
+      const signature = await account.signMessage(typedDataExample);
+      const [r, s] = stark.formatSignature(signature);
 
-    // change the signature to make it invalid
-    const r2 = toBigInt(r) + 123n;
+      // change the signature to make it invalid
+      const r2 = toBigInt(r) + 123n;
 
-    const signature2 = new Signature(toBigInt(r2.toString()), toBigInt(s));
+      const signature2 = new Signature(toBigInt(r2.toString()), toBigInt(s));
 
-    if (!signature2) return;
+      if (!signature2) return;
 
-    expect(await account.verifyMessage(typedDataExample, signature2)).toBe(false);
-  });
+      const verifMessageResponse: boolean = await account.verifyMessage(
+        typedDataExample,
+        signature2
+      );
+      expect(verifMessageResponse).toBe(false);
 
-  test('sign and verify offchain message', async () => {
-    const signature = await account.signMessage(typedDataExample);
-    expect(await account.verifyMessage(typedDataExample, signature)).toBe(true);
+      const wrongAccount = new Account(
+        provider,
+        '0x037891',
+        '0x026789',
+        undefined,
+        TEST_TX_VERSION
+      ); // non existing account
+      await expect(wrongAccount.verifyMessage(typedDataExample, signature2)).rejects.toThrow();
+    });
+
+    test('sign and verify message', async () => {
+      const signature = await account.signMessage(typedDataExample);
+      const verifMessageResponse: boolean = await account.verifyMessage(
+        typedDataExample,
+        signature
+      );
+      expect(verifMessageResponse).toBe(true);
+    });
   });
 
   describe('Contract interaction with Account', () => {
@@ -442,78 +487,6 @@ describe('deploy and test Wallet', () => {
         await provider.waitForTransaction(declareTx.transaction_hash);
       }
       expect(declareTx).toMatchSchemaRef('DeclareContractResponse');
-    });
-
-    test('Get the stark name of the account and account from stark name (using starknet.id)', async () => {
-      // Deploy naming contract
-      const namingResponse = await account.declareAndDeploy({
-        contract: compiledNamingContract,
-      });
-      const namingAddress = namingResponse.deploy.contract_address;
-
-      // Deploy Starknet id contract
-      const idResponse = await account.declareAndDeploy({
-        contract: compiledStarknetId,
-      });
-      const idAddress = idResponse.deploy.contract_address;
-
-      // Create signature from private key
-      const whitelistingPublicKey =
-        '1893860513534673656759973582609638731665558071107553163765293299136715951024';
-      const whitelistingPrivateKey =
-        '301579081698031303837612923223391524790804435085778862878979120159194507372';
-      const hashed = ec.starkCurve.pedersen(
-        ec.starkCurve.pedersen(toBigInt('18925'), toBigInt('1922775124')),
-        toBigInt(account.address)
-      );
-      const signed = ec.starkCurve.sign(hashed, toHex(whitelistingPrivateKey));
-
-      const { transaction_hash } = await account.execute([
-        {
-          contractAddress: namingAddress,
-          entrypoint: 'initializer',
-          calldata: [
-            idAddress, // starknetid_contract_addr
-            '0', // pricing_contract_addr
-            account.address, // admin
-            whitelistingPublicKey, // whitelisting_key
-            '0', // l1_contract
-          ],
-        },
-        {
-          contractAddress: idAddress,
-          entrypoint: 'mint',
-          calldata: ['1'], // TokenId
-        },
-        {
-          contractAddress: namingAddress,
-          entrypoint: 'whitelisted_mint',
-          calldata: [
-            '18925', // Domain encoded "ben"
-            '1922775124', // Expiry
-            '1', // Starknet id linked
-            account.address, // receiver_address
-            signed.r, // sig 0 for whitelist
-            signed.s, // sig 1 for whitelist
-          ],
-        },
-        {
-          contractAddress: namingAddress,
-          entrypoint: 'set_address_to_domain',
-          calldata: [
-            '1', // length
-            '18925', // Domain encoded "ben"
-          ],
-        },
-      ]);
-
-      await provider.waitForTransaction(transaction_hash);
-
-      const address = await account.getAddressFromStarkName('ben.stark', namingAddress);
-      expect(hexToDecimalString(address as string)).toEqual(hexToDecimalString(account.address));
-
-      const name = await account.getStarkName(undefined, namingAddress);
-      expect(name).toEqual('ben.stark');
     });
   });
 
@@ -559,7 +532,7 @@ describe('deploy and test Wallet', () => {
 
       // check pre-calculated address
       const txReceipt = await provider.waitForTransaction(deployment.transaction_hash);
-      const udcEvent = parseUDCEvent(txReceipt as DeployTransactionReceiptResponse);
+      const udcEvent = events.parseUDCEvent(txReceipt as any); // todo: when time fix types
       expect(cleanHex(deployment.contract_address[0])).toBe(cleanHex(udcEvent.contract_address));
     });
 
@@ -580,7 +553,7 @@ describe('deploy and test Wallet', () => {
 
       // check pre-calculated address
       const txReceipt = await provider.waitForTransaction(deployment.transaction_hash);
-      const udcEvent = parseUDCEvent(txReceipt as DeployTransactionReceiptResponse);
+      const udcEvent = events.parseUDCEvent(txReceipt as any); // todo: when time fix types
       expect(cleanHex(deployment.contract_address[0])).toBe(cleanHex(udcEvent.contract_address));
     });
 
@@ -645,6 +618,10 @@ describe('deploy and test Wallet', () => {
         contractAddress: precalculatedAddress,
       });
       expect(result).toMatchSchemaRef('EstimateFee');
+    });
+
+    test('estimate fee bulk on empty invocations', async () => {
+      await expect(account.estimateFeeBulk([])).rejects.toThrow(TypeError);
     });
 
     test('estimate fee bulk invoke functions', async () => {
@@ -718,22 +695,80 @@ describe('deploy and test Wallet', () => {
     });
 
     describeIfDevnet('declare tests only on devnet', () => {
-      test('declare, deploy & multi invoke functions', async () => {
-        const res = await account.estimateFeeBulk([
-          /*         {
-            // Cairo 1.1.0, if declared estimate error with can't redeclare same contract
-            type: TransactionType.DECLARE,
-            contract: compiledHelloSierra,
-            casm: compiledHelloSierraCasm,
-          }, */
+      test('Manual: declare, deploy & multi invoke functions', async () => {
+        /*
+         * For Cairo0 and Cairo1 contracts re-declaration of the class throw an errors
+         * as soo We first need to test is class is already declared
+         */
+        const isDeclaredCairo0 = await account.isClassDeclared({
+          classHash: '0x54328a1075b8820eb43caf0caa233923148c983742402dcfc38541dd843d01a',
+        });
+
+        const hashes = extractContractHashes({
+          contract: compiledHelloSierra,
+          casm: compiledHelloSierraCasm,
+        });
+
+        const isDeclaredCairo1 = await account.isClassDeclared({ classHash: hashes.classHash });
+
+        const invocations = [
           {
-            // Cairo 0
-            type: TransactionType.DECLARE,
+            type: TransactionType.INVOKE,
+            payload: [
+              {
+                contractAddress: erc20Address,
+                entrypoint: 'approve',
+                calldata: {
+                  address: erc20Address,
+                  amount: uint256(10),
+                },
+              },
+              {
+                contractAddress: erc20Address,
+                entrypoint: 'transfer',
+                calldata: [erc20.address, '10', '0'],
+              },
+            ],
+          },
+          {
+            type: TransactionType.DEPLOY,
             payload: {
-              contract: compiledErc20,
               classHash: '0x54328a1075b8820eb43caf0caa233923148c983742402dcfc38541dd843d01a',
+              constructorCalldata: ['Token', 'ERC20', account.address],
             },
           },
+          ...(!isDeclaredCairo0
+            ? [
+                {
+                  // Cairo 0
+                  type: TransactionType.DECLARE,
+                  payload: {
+                    contract: compiledErc20,
+                    classHash: '0x54328a1075b8820eb43caf0caa233923148c983742402dcfc38541dd843d01a',
+                  },
+                },
+              ]
+            : []),
+          ...(!isDeclaredCairo1
+            ? [
+                {
+                  // Cairo 1.1.0, if declared estimate error with can't redeclare same contract
+                  type: TransactionType.DECLARE,
+                  contract: compiledHelloSierra,
+                  casm: compiledHelloSierraCasm,
+                },
+              ]
+            : []),
+        ];
+
+        const res = await account.estimateFeeBulk(invocations);
+        res.forEach((value) => {
+          expect(value).toMatchSchemaRef('EstimateFee');
+        });
+      });
+
+      test('prepareInvocations: unordered declare, deploy & multi invoke', async () => {
+        const invocations = await provider.prepareInvocations([
           {
             type: TransactionType.DEPLOY,
             payload: {
@@ -759,8 +794,23 @@ describe('deploy and test Wallet', () => {
               },
             ],
           },
+          {
+            // Cairo 0
+            type: TransactionType.DECLARE,
+            payload: {
+              contract: compiledErc20,
+              classHash: '0x54328a1075b8820eb43caf0caa233923148c983742402dcfc38541dd843d01a',
+            },
+          },
+          {
+            // Cairo 1.1.0, if declared estimate error with can't redeclare same contract
+            type: TransactionType.DECLARE,
+            contract: compiledHelloSierra,
+            casm: compiledHelloSierraCasm,
+          },
         ]);
-        expect(res).toHaveLength(3);
+
+        const res = await account.estimateFeeBulk(invocations);
         res.forEach((value) => {
           expect(value).toMatchSchemaRef('EstimateFee');
         });
@@ -792,7 +842,7 @@ describe('deploy and test Wallet', () => {
 });
 
 describe('unit', () => {
-  describeIfDevnetSequencer('devnet sequencer', () => {
+  describeIfDevnet('Devnet', () => {
     initializeMatcher(expect);
     const provider = getTestProvider();
     const account = getTestAccount(provider);

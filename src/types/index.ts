@@ -6,15 +6,7 @@ export * from './provider';
 export * from './signer';
 export * from './typedData';
 export * from './cairoEnum';
+export * from './transactionReceipt';
+export * from './outsideExecution';
 
-export * as RPC from './api/rpc';
-export {
-  CallL1Handler,
-  DeployedContractItem,
-  ExecutionResources,
-  FunctionInvocation,
-  GetContractAddressesResponse,
-  GetTransactionStatusResponse,
-  SequencerIdentifier,
-} from './api/sequencer';
-export * as Sequencer from './api/sequencer';
+export * as RPC from './api';

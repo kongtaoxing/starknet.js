@@ -1,475 +1,308 @@
+import type { SPEC } from 'starknet-types-07';
+
+import { RPC06, RPC07, RpcChannel } from '../channel';
 import {
-  HEX_STR_TRANSACTION_VERSION_1,
-  HEX_STR_TRANSACTION_VERSION_2,
-  NetworkName,
-  RPC_DEFAULT_VERSION,
-  RPC_NODES,
-  StarknetChainId,
-} from '../constants';
-import {
-  AccountInvocationItem,
   AccountInvocations,
   BigNumberish,
+  Block,
   BlockIdentifier,
   BlockTag,
   Call,
+  ContractClassResponse,
+  ContractClassIdentifier,
   ContractVersion,
   DeclareContractTransaction,
   DeployAccountContractTransaction,
-  GetCodeResponse,
+  GetBlockResponse,
+  GetTxReceiptResponseWithoutHelper,
   Invocation,
+  Invocations,
   InvocationsDetailsWithNonce,
+  PendingBlock,
+  PendingStateUpdate,
   RPC,
   RpcProviderOptions,
+  StateUpdate,
+  StateUpdateResponse,
   TransactionType,
   getContractVersionOptions,
   getEstimateFeeBulkOptions,
   getSimulateTransactionOptions,
+  type Signature,
+  type TypedData,
   waitForTransactionOptions,
 } from '../types';
+import type { TransactionWithHash } from '../types/provider/spec';
+import assert from '../utils/assert';
 import { CallData } from '../utils/calldata';
 import { getAbiContractVersion } from '../utils/calldata/cairo';
-import { isSierra } from '../utils/contract';
-import fetch from '../utils/fetchPonyfill';
-import { getSelector, getSelectorFromName, getVersionsByType } from '../utils/hash';
-import { stringify } from '../utils/json';
-import { getHexStringArray, toHex, toStorageKey } from '../utils/num';
+import { extractContractHashes, isSierra } from '../utils/contract';
+import { solidityUint256PackedKeccak256 } from '../utils/hash';
+import { isBigNumberish, toBigInt, toHex } from '../utils/num';
 import { wait } from '../utils/provider';
 import { RPCResponseParser } from '../utils/responseParser/rpc';
-import { decompressProgram, signatureToHexArray } from '../utils/stark';
+import { formatSignature } from '../utils/stark';
+import { GetTransactionReceiptResponse, ReceiptTx } from '../utils/transactionReceipt';
+import { getMessageHash, validateTypedData } from '../utils/typedData';
 import { LibraryError } from './errors';
 import { ProviderInterface } from './interface';
-import { getAddressFromStarkName, getStarkName } from './starknetId';
-import { Block } from './utils';
-
-/**
- * Return randomly select available public node
- * @param networkName NetworkName
- * @param mute mute public node warning
- * @returns default node url
- */
-export const getDefaultNodeUrl = (
-  networkName?: NetworkName,
-  mute: boolean = false,
-  version: 'v0_5' | 'v0_6' = RPC_DEFAULT_VERSION
-): string => {
-  if (!mute)
-    // eslint-disable-next-line no-console
-    console.warn('Using default public node url, please provide nodeUrl in provider options!');
-  const nodes = RPC_NODES[networkName ?? NetworkName.SN_GOERLI];
-  const randIdx = Math.floor(Math.random() * nodes.length);
-  return `${nodes[randIdx]}${version}`;
-};
-
-const defaultOptions = {
-  headers: { 'Content-Type': 'application/json' },
-  blockIdentifier: BlockTag.pending,
-  retries: 200,
-};
 
 export class RpcProvider implements ProviderInterface {
-  public nodeUrl: string;
+  public responseParser: RPCResponseParser;
 
-  public headers: object;
+  public channel: RPC07.RpcChannel | RPC06.RpcChannel;
 
-  private responseParser = new RPCResponseParser();
-
-  private retries: number;
-
-  private blockIdentifier: BlockIdentifier;
-
-  private chainId?: StarknetChainId;
-
-  constructor(optionsOrProvider?: RpcProviderOptions) {
-    const { nodeUrl, retries, headers, blockIdentifier, chainId, rpcVersion } =
-      optionsOrProvider || {};
-    if (Object.values(NetworkName).includes(nodeUrl as NetworkName)) {
-      // Network name provided for nodeUrl
-      this.nodeUrl = getDefaultNodeUrl(
-        nodeUrl as NetworkName,
-        optionsOrProvider?.default,
-        rpcVersion
-      );
-    } else if (nodeUrl) {
-      // NodeUrl provided
-      this.nodeUrl = nodeUrl;
+  constructor(optionsOrProvider?: RpcProviderOptions | ProviderInterface | RpcProvider) {
+    if (optionsOrProvider && 'channel' in optionsOrProvider) {
+      this.channel = optionsOrProvider.channel;
+      this.responseParser =
+        'responseParser' in optionsOrProvider
+          ? optionsOrProvider.responseParser
+          : new RPCResponseParser();
     } else {
-      // none provided fallback to default testnet
-      this.nodeUrl = getDefaultNodeUrl(undefined, optionsOrProvider?.default, rpcVersion);
+      this.channel = new RpcChannel({ ...optionsOrProvider, waitMode: false });
+      this.responseParser = new RPCResponseParser(optionsOrProvider?.feeMarginPercentage);
     }
-    this.retries = retries || defaultOptions.retries;
-    this.headers = { ...defaultOptions.headers, ...headers };
-    this.blockIdentifier = blockIdentifier || defaultOptions.blockIdentifier;
-    this.chainId = chainId; // setting to a non-null value skips making a request in getChainId()
   }
 
   public fetch(method: string, params?: object, id: string | number = 0) {
-    const rpcRequestBody: RPC.JRPC.RequestBody = {
-      id,
-      jsonrpc: '2.0',
-      method,
-      ...(params && { params }),
-    };
-    return fetch(this.nodeUrl, {
-      method: 'POST',
-      body: stringify(rpcRequestBody),
-      headers: this.headers as Record<string, string>,
-    });
-  }
-
-  protected errorHandler(method: string, params: any, rpcError?: RPC.JRPC.Error, otherError?: any) {
-    if (rpcError) {
-      const { code, message, data } = rpcError;
-      throw new LibraryError(
-        `RPC: ${method} with params ${stringify(params)}\n ${code}: ${message}: ${stringify(data)}`
-      );
-    }
-    if (otherError instanceof LibraryError) {
-      throw otherError;
-    }
-    if (otherError) {
-      throw Error(otherError.message);
-    }
-  }
-
-  protected async fetchEndpoint<T extends keyof RPC.Methods>(
-    method: T,
-    params?: RPC.Methods[T]['params']
-  ): Promise<RPC.Methods[T]['result']> {
-    try {
-      const rawResult = await this.fetch(method, params);
-      const { error, result } = await rawResult.json();
-      this.errorHandler(method, params, error);
-      return result as RPC.Methods[T]['result'];
-    } catch (error: any) {
-      this.errorHandler(method, params, error?.response?.data, error);
-      throw error;
-    }
+    return this.channel.fetch(method, params, id);
   }
 
   public async getChainId() {
-    this.chainId ??= (await this.fetchEndpoint('starknet_chainId')) as StarknetChainId;
-    return this.chainId;
+    return this.channel.getChainId();
   }
 
-  /**
-   * NEW: Returns the version of the Starknet JSON-RPC specification being used
-   */
   public async getSpecVersion() {
-    return this.fetchEndpoint('starknet_specVersion');
+    return this.channel.getSpecVersion();
   }
 
   public async getNonceForAddress(
     contractAddress: BigNumberish,
-    blockIdentifier: BlockIdentifier = this.blockIdentifier
+    blockIdentifier?: BlockIdentifier
   ) {
-    const contract_address = toHex(contractAddress);
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_getNonce', {
-      contract_address,
-      block_id,
-    });
+    return this.channel.getNonceForAddress(contractAddress, blockIdentifier);
   }
 
-  /**
-   * @deprecated use getBlockWithTxHashes or getBlockWithTxs (will be removed on sequencer deprecation)
-   */
-  public async getBlock(blockIdentifier: BlockIdentifier = this.blockIdentifier) {
-    return this.getBlockWithTxHashes(blockIdentifier).then(
-      this.responseParser.parseGetBlockResponse
-    );
+  public async getBlock(): Promise<PendingBlock>;
+  public async getBlock(blockIdentifier: 'pending'): Promise<PendingBlock>;
+  public async getBlock(blockIdentifier: 'latest'): Promise<Block>;
+  public async getBlock(blockIdentifier?: BlockIdentifier): Promise<GetBlockResponse>;
+  public async getBlock(blockIdentifier?: BlockIdentifier) {
+    return this.channel
+      .getBlockWithTxHashes(blockIdentifier)
+      .then(this.responseParser.parseGetBlockResponse);
   }
-
-  /**
-   * @deprecated renamed to getBlockLatestAccepted(); (will be removed in next minor version)
-   */
-  public getBlockHashAndNumber = this.getBlockLatestAccepted;
 
   /**
    * Get the most recent accepted block hash and number
    */
   public async getBlockLatestAccepted() {
-    return this.fetchEndpoint('starknet_blockHashAndNumber');
+    return this.channel.getBlockLatestAccepted();
   }
 
   /**
-   * @deprecated redundant use getBlockLatestAccepted();
    * Get the most recent accepted block number
+   * redundant use getBlockLatestAccepted();
    * @returns Number of the latest block
    */
   public async getBlockNumber() {
-    return this.fetchEndpoint('starknet_blockNumber');
+    return this.channel.getBlockNumber();
   }
 
-  public async getBlockWithTxHashes(blockIdentifier: BlockIdentifier = this.blockIdentifier) {
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_getBlockWithTxHashes', { block_id });
+  public async getBlockWithTxHashes(blockIdentifier?: BlockIdentifier) {
+    return this.channel.getBlockWithTxHashes(blockIdentifier);
   }
 
-  public async getBlockWithTxs(blockIdentifier: BlockIdentifier = this.blockIdentifier) {
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_getBlockWithTxs', { block_id });
-  }
-
-  public async getBlockStateUpdate(blockIdentifier: BlockIdentifier = this.blockIdentifier) {
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_getStateUpdate', { block_id });
+  public async getBlockWithTxs(blockIdentifier?: BlockIdentifier) {
+    return this.channel.getBlockWithTxs(blockIdentifier);
   }
 
   /**
-   * @deprecated renamed to getBlockStateUpdate();
+   * Pause the execution of the script until a specified block is created.
+   * @param {BlockIdentifier} blockIdentifier bloc number (BigNumberish) or 'pending' or 'latest'.
+   * Use of 'latest" or of a block already created will generate no pause.
+   * @param {number} [retryInterval] number of milliseconds between 2 requests to the node
+   * @example
+   * ```typescript
+   * await myProvider.waitForBlock();
+   * // wait the creation of the pending block
+   * ```
    */
+  public async waitForBlock(
+    blockIdentifier: BlockIdentifier = 'pending',
+    retryInterval: number = 5000
+  ) {
+    if (blockIdentifier === BlockTag.LATEST) return;
+    const currentBlock = await this.getBlockNumber();
+    const targetBlock =
+      blockIdentifier === BlockTag.PENDING
+        ? currentBlock + 1
+        : Number(toHex(blockIdentifier as BigNumberish));
+    if (targetBlock <= currentBlock) return;
+    const { retries } = this.channel;
+    let retriesCount = retries;
+    let isTargetBlock: boolean = false;
+    while (!isTargetBlock) {
+      // eslint-disable-next-line no-await-in-loop
+      const currBlock = await this.getBlockNumber();
+      if (currBlock === targetBlock) {
+        isTargetBlock = true;
+      } else {
+        // eslint-disable-next-line no-await-in-loop
+        await wait(retryInterval);
+      }
+      retriesCount -= 1;
+      if (retriesCount <= 0) {
+        throw new Error(`waitForBlock() timed-out after ${retries} tries.`);
+      }
+    }
+  }
+
+  public async getL1GasPrice(blockIdentifier?: BlockIdentifier) {
+    return this.channel
+      .getBlockWithTxHashes(blockIdentifier)
+      .then(this.responseParser.parseL1GasPriceResponse);
+  }
+
+  public async getL1MessageHash(l2TxHash: BigNumberish): Promise<string> {
+    const transaction = (await this.channel.getTransactionByHash(l2TxHash)) as TransactionWithHash;
+    assert(transaction.type === 'L1_HANDLER', 'This L2 transaction is not a L1 message.');
+    const { calldata, contract_address, entry_point_selector, nonce } =
+      transaction as SPEC.L1_HANDLER_TXN;
+    const params = [
+      calldata[0],
+      contract_address,
+      nonce,
+      entry_point_selector,
+      calldata.length - 1,
+      ...calldata.slice(1),
+    ];
+    return solidityUint256PackedKeccak256(params);
+  }
+
+  public async getBlockWithReceipts(blockIdentifier?: BlockIdentifier) {
+    if (this.channel instanceof RPC06.RpcChannel)
+      throw new LibraryError('Unsupported method for RPC version');
+
+    return this.channel.getBlockWithReceipts(blockIdentifier);
+  }
+
   public getStateUpdate = this.getBlockStateUpdate;
 
-  public async getBlockTransactionsTraces(blockIdentifier: BlockIdentifier = this.blockIdentifier) {
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_traceBlockTransactions', { block_id });
+  public async getBlockStateUpdate(): Promise<PendingStateUpdate>;
+  public async getBlockStateUpdate(blockIdentifier: 'pending'): Promise<PendingStateUpdate>;
+  public async getBlockStateUpdate(blockIdentifier: 'latest'): Promise<StateUpdate>;
+  public async getBlockStateUpdate(blockIdentifier?: BlockIdentifier): Promise<StateUpdateResponse>;
+  public async getBlockStateUpdate(blockIdentifier?: BlockIdentifier) {
+    return this.channel.getBlockStateUpdate(blockIdentifier);
   }
 
-  /**
-   * Returns the execution traces of all transactions included in the given block
-   * @deprecated renamed to getBlockTransactionsTraces()
-   */
-  public traceBlockTransactions = this.getBlockTransactionsTraces;
-
-  public async getBlockTransactionCount(blockIdentifier: BlockIdentifier = this.blockIdentifier) {
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_getBlockTransactionCount', { block_id });
+  public async getBlockTransactionsTraces(blockIdentifier?: BlockIdentifier) {
+    return this.channel.getBlockTransactionsTraces(blockIdentifier);
   }
 
-  /**
-   * Get the number of transactions in a block given a block id
-   * @deprecated renamed to getBlockTransactionCount()
-   * @returns Number of transactions
-   */
-  public getTransactionCount = this.getBlockTransactionCount;
+  public async getBlockTransactionCount(blockIdentifier?: BlockIdentifier) {
+    return this.channel.getBlockTransactionCount(blockIdentifier);
+  }
 
   /**
    * Return transactions from pending block
-   * @deprecated Instead use getBlock(BlockTag.pending); (will be removed in next minor version)
+   * @deprecated Instead use getBlock(BlockTag.PENDING); (will be removed in next minor version)
+   * Utility method, same result can be achieved using getBlockWithTxHashes(BlockTag.pending);
    */
   public async getPendingTransactions() {
-    const { transactions } = await this.getBlock(BlockTag.pending);
-    return Promise.all(transactions.map((it) => this.getTransactionByHash(it)));
+    const { transactions } = await this.getBlockWithTxHashes(BlockTag.PENDING).then(
+      this.responseParser.parseGetBlockResponse
+    );
+    return Promise.all(transactions.map((it: any) => this.getTransactionByHash(it)));
   }
 
-  /**
-   * @deprecated use getTransactionByHash or getTransactionByBlockIdAndIndex (will be removed on sequencer deprecation)
-   */
   public async getTransaction(txHash: BigNumberish) {
-    return this.getTransactionByHash(txHash).then(this.responseParser.parseGetTransactionResponse);
+    return this.channel.getTransactionByHash(txHash);
   }
 
   public async getTransactionByHash(txHash: BigNumberish) {
-    const transaction_hash = toHex(txHash);
-    return this.fetchEndpoint('starknet_getTransactionByHash', {
-      transaction_hash,
-    });
+    return this.channel.getTransactionByHash(txHash);
   }
 
   public async getTransactionByBlockIdAndIndex(blockIdentifier: BlockIdentifier, index: number) {
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_getTransactionByBlockIdAndIndex', { block_id, index });
+    return this.channel.getTransactionByBlockIdAndIndex(blockIdentifier, index);
   }
 
-  public async getTransactionReceipt(txHash: BigNumberish) {
-    const transaction_hash = toHex(txHash);
-    return this.fetchEndpoint('starknet_getTransactionReceipt', { transaction_hash });
+  public async getTransactionReceipt(txHash: BigNumberish): Promise<GetTransactionReceiptResponse> {
+    const txReceiptWoHelper = await this.channel.getTransactionReceipt(txHash);
+    const txReceiptWoHelperModified: GetTxReceiptResponseWithoutHelper =
+      this.responseParser.parseTransactionReceipt(txReceiptWoHelper);
+    return new ReceiptTx(txReceiptWoHelperModified) as GetTransactionReceiptResponse;
   }
 
   public async getTransactionTrace(txHash: BigNumberish) {
-    const transaction_hash = toHex(txHash);
-    return this.fetchEndpoint('starknet_traceTransaction', { transaction_hash });
+    return this.channel.getTransactionTrace(txHash);
   }
 
   /**
-   * @deprecated renamed to getTransactionTrace();
-   * For a given executed transaction, return the trace of its execution, including internal calls
-   */
-  public traceTransaction = this.getTransactionTrace;
-
-  /**
-   * NEW: Get the status of a transaction
+   * Get the status of a transaction
    */
   public async getTransactionStatus(transactionHash: BigNumberish) {
-    const transaction_hash = toHex(transactionHash);
-    return this.fetchEndpoint('starknet_getTransactionStatus', { transaction_hash });
+    return this.channel.getTransactionStatus(transactionHash);
   }
-
-  /**
-   * @deprecated renamed to simulateTransaction();
-   */
-  public getSimulateTransaction = this.simulateTransaction;
 
   /**
    * @param invocations AccountInvocations
-   * @param simulateTransactionOptions blockIdentifier and flags to skip validation and fee charge<br/>
+   * @param options blockIdentifier and flags to skip validation and fee charge<br/>
    * - blockIdentifier<br/>
    * - skipValidate (default false)<br/>
    * - skipFeeCharge (default true)<br/>
    */
-  public async simulateTransaction(
+  public async getSimulateTransaction(
     invocations: AccountInvocations,
-    {
-      blockIdentifier = this.blockIdentifier,
-      skipValidate = false,
-      skipFeeCharge = true,
-    }: getSimulateTransactionOptions
+    options?: getSimulateTransactionOptions
   ) {
-    const block_id = new Block(blockIdentifier).identifier;
-    const simulationFlags = [];
-    if (skipValidate) simulationFlags.push(RPC.ESimulationFlag.SKIP_VALIDATE);
-    if (skipFeeCharge) simulationFlags.push(RPC.ESimulationFlag.SKIP_FEE_CHARGE);
-
-    return this.fetchEndpoint('starknet_simulateTransactions', {
-      block_id,
-      transactions: invocations.map((it) => this.buildTransaction(it)),
-      simulation_flags: simulationFlags,
-    }).then(this.responseParser.parseSimulateTransactionResponse);
+    // can't be named simulateTransaction because of argument conflict with account
+    return this.channel
+      .simulateTransaction(invocations, options)
+      .then((r) => this.responseParser.parseSimulateTransactionResponse(r));
   }
 
-  public async waitForTransaction(txHash: BigNumberish, options?: waitForTransactionOptions) {
-    const transactionHash = toHex(txHash);
-    let { retries } = this;
-    let onchain = false;
-    let isErrorState = false;
-    const retryInterval = options?.retryInterval ?? 5000;
-    const errorStates: any = options?.errorStates ?? [
-      RPC.ETransactionStatus.REJECTED,
-      // TODO: commented out to preserve the long-standing behavior of "reverted" not being treated as an error by default
-      // should decide which behavior to keep in the future
-      // RPC.ETransactionExecutionStatus.REVERTED,
-    ];
-    const successStates: any = options?.successStates ?? [
-      RPC.ETransactionExecutionStatus.SUCCEEDED,
-      RPC.ETransactionStatus.ACCEPTED_ON_L2,
-      RPC.ETransactionStatus.ACCEPTED_ON_L1,
-    ];
+  public async waitForTransaction(
+    txHash: BigNumberish,
+    options?: waitForTransactionOptions
+  ): Promise<GetTransactionReceiptResponse> {
+    const receiptWoHelper = (await this.channel.waitForTransaction(
+      txHash,
+      options
+    )) as GetTxReceiptResponseWithoutHelper;
 
-    let txStatus: RPC.TransactionStatus;
-    while (!onchain) {
-      // eslint-disable-next-line no-await-in-loop
-      await wait(retryInterval);
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        txStatus = await this.getTransactionStatus(transactionHash);
-
-        const executionStatus = txStatus.execution_status;
-        const finalityStatus = txStatus.finality_status;
-
-        if (!finalityStatus) {
-          // Transaction is potentially NOT_RECEIVED or RPC not Synced yet
-          // so we will retry '{ retries }' times
-          const error = new Error('waiting for transaction status');
-          throw error;
-        }
-
-        if (errorStates.includes(executionStatus) || errorStates.includes(finalityStatus)) {
-          const message = `${executionStatus}: ${finalityStatus}`;
-          const error = new Error(message) as Error & { response: RPC.TransactionStatus };
-          error.response = txStatus;
-          isErrorState = true;
-          throw error;
-        } else if (
-          successStates.includes(executionStatus) ||
-          successStates.includes(finalityStatus)
-        ) {
-          onchain = true;
-        }
-      } catch (error) {
-        if (error instanceof Error && isErrorState) {
-          throw error;
-        }
-
-        if (retries <= 0) {
-          throw new Error(`waitForTransaction timed-out with retries ${this.retries}`);
-        }
-      }
-
-      retries -= 1;
-    }
-
-    /**
-     * For some nodes even though the transaction has executionStatus SUCCEEDED finalityStatus ACCEPTED_ON_L2, getTransactionReceipt returns "Transaction hash not found"
-     * Retry until rpc is actually ready to work with txHash
-     */
-    let txReceipt = null;
-    while (txReceipt === null) {
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        txReceipt = await this.getTransactionReceipt(transactionHash);
-      } catch (error) {
-        if (retries <= 0) {
-          throw new Error(`waitForTransaction timed-out with retries ${this.retries}`);
-        }
-      }
-      retries -= 1;
-      // eslint-disable-next-line no-await-in-loop
-      await wait(retryInterval);
-    }
-    return txReceipt as RPC.TransactionReceipt;
+    return new ReceiptTx(receiptWoHelper) as GetTransactionReceiptResponse;
   }
 
   public async getStorageAt(
     contractAddress: BigNumberish,
     key: BigNumberish,
-    blockIdentifier: BlockIdentifier = this.blockIdentifier
+    blockIdentifier?: BlockIdentifier
   ) {
-    const contract_address = toHex(contractAddress);
-    const parsedKey = toStorageKey(key);
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_getStorageAt', {
-      contract_address,
-      key: parsedKey,
-      block_id,
-    });
+    return this.channel.getStorageAt(contractAddress, key, blockIdentifier);
   }
 
-  public async getClassHashAt(
-    contractAddress: BigNumberish,
-    blockIdentifier: BlockIdentifier = this.blockIdentifier
-  ) {
-    const contract_address = toHex(contractAddress);
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_getClassHashAt', {
-      block_id,
-      contract_address,
-    });
+  public async getClassHashAt(contractAddress: BigNumberish, blockIdentifier?: BlockIdentifier) {
+    return this.channel.getClassHashAt(contractAddress, blockIdentifier);
   }
 
   public async getClassByHash(classHash: BigNumberish) {
     return this.getClass(classHash);
   }
 
-  public async getClass(
-    classHash: BigNumberish,
-    blockIdentifier: BlockIdentifier = this.blockIdentifier
-  ) {
-    const class_hash = toHex(classHash);
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_getClass', {
-      class_hash,
-      block_id,
-    }).then(this.responseParser.parseContractClassResponse);
+  public async getClass(classHash: BigNumberish, blockIdentifier?: BlockIdentifier) {
+    return this.channel
+      .getClass(classHash, blockIdentifier)
+      .then(this.responseParser.parseContractClassResponse);
   }
 
-  public async getClassAt(
-    contractAddress: BigNumberish,
-    blockIdentifier: BlockIdentifier = this.blockIdentifier
-  ) {
-    const contract_address = toHex(contractAddress);
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_getClassAt', {
-      block_id,
-      contract_address,
-    }).then(this.responseParser.parseContractClassResponse);
-  }
-
-  public async getCode(
-    _contractAddress: string,
-    _blockIdentifier?: BlockIdentifier
-  ): Promise<GetCodeResponse> {
-    throw new Error('RPC does not implement getCode function');
+  public async getClassAt(contractAddress: BigNumberish, blockIdentifier?: BlockIdentifier) {
+    return this.channel
+      .getClassAt(contractAddress, blockIdentifier)
+      .then(this.responseParser.parseContractClassResponse);
   }
 
   public async getContractVersion(
@@ -486,9 +319,12 @@ export class RpcProvider implements ProviderInterface {
   public async getContractVersion(
     contractAddress?: BigNumberish,
     classHash?: BigNumberish,
-    { blockIdentifier = this.blockIdentifier, compiler = true }: getContractVersionOptions = {}
+    {
+      blockIdentifier = this.channel.blockIdentifier,
+      compiler = true,
+    }: getContractVersionOptions = {}
   ): Promise<ContractVersion> {
-    let contractClass;
+    let contractClass: ContractClassResponse;
     if (contractAddress) {
       contractClass = await this.getClassAt(contractAddress, blockIdentifier);
     } else if (classHash) {
@@ -513,196 +349,115 @@ export class RpcProvider implements ProviderInterface {
   public async getEstimateFee(
     invocation: Invocation,
     invocationDetails: InvocationsDetailsWithNonce,
-    blockIdentifier: BlockIdentifier = this.blockIdentifier
+    blockIdentifier?: BlockIdentifier,
+    skipValidate?: boolean
   ) {
-    return this.getInvokeEstimateFee(invocation, invocationDetails, blockIdentifier);
+    return this.getInvokeEstimateFee(invocation, invocationDetails, blockIdentifier, skipValidate);
   }
 
   public async getInvokeEstimateFee(
     invocation: Invocation,
     invocationDetails: InvocationsDetailsWithNonce,
-    blockIdentifier: BlockIdentifier = this.blockIdentifier
+    blockIdentifier?: BlockIdentifier,
+    skipValidate?: boolean
   ) {
-    const block_id = new Block(blockIdentifier).identifier;
-    const transaction = this.buildTransaction(
-      {
-        type: TransactionType.INVOKE,
-        ...invocation,
-        ...invocationDetails,
-      },
-      'fee'
-    );
-    return this.fetchEndpoint('starknet_estimateFee', {
-      request: [transaction],
-      block_id,
-    }).then(this.responseParser.parseFeeEstimateResponse);
+    return this.channel
+      .getEstimateFee(
+        [
+          {
+            type: TransactionType.INVOKE,
+            ...invocation,
+            ...invocationDetails,
+          },
+        ],
+        { blockIdentifier, skipValidate }
+      )
+      .then((r) => this.responseParser.parseFeeEstimateResponse(r));
   }
 
   public async getDeclareEstimateFee(
     invocation: DeclareContractTransaction,
     details: InvocationsDetailsWithNonce,
-    blockIdentifier: BlockIdentifier = this.blockIdentifier
+    blockIdentifier?: BlockIdentifier,
+    skipValidate?: boolean
   ) {
-    const block_id = new Block(blockIdentifier).identifier;
-    const transaction = this.buildTransaction(
-      {
-        type: TransactionType.DECLARE,
-        ...invocation,
-        ...details,
-      },
-      'fee'
-    );
-    return this.fetchEndpoint('starknet_estimateFee', {
-      request: [transaction],
-      block_id,
-    }).then(this.responseParser.parseFeeEstimateResponse);
+    return this.channel
+      .getEstimateFee(
+        [
+          {
+            type: TransactionType.DECLARE,
+            ...invocation,
+            ...details,
+          },
+        ],
+        { blockIdentifier, skipValidate }
+      )
+      .then((r) => this.responseParser.parseFeeEstimateResponse(r));
   }
 
   public async getDeployAccountEstimateFee(
     invocation: DeployAccountContractTransaction,
     details: InvocationsDetailsWithNonce,
-    blockIdentifier: BlockIdentifier = this.blockIdentifier
+    blockIdentifier?: BlockIdentifier,
+    skipValidate?: boolean
   ) {
-    const block_id = new Block(blockIdentifier).identifier;
-    const transaction = this.buildTransaction(
-      {
-        type: TransactionType.DEPLOY_ACCOUNT,
-        ...invocation,
-        ...details,
-      },
-      'fee'
-    );
-    return this.fetchEndpoint('starknet_estimateFee', {
-      request: [transaction],
-      block_id,
-    }).then(this.responseParser.parseFeeEstimateResponse);
+    return this.channel
+      .getEstimateFee(
+        [
+          {
+            type: TransactionType.DEPLOY_ACCOUNT,
+            ...invocation,
+            ...details,
+          },
+        ],
+        { blockIdentifier, skipValidate }
+      )
+      .then((r) => this.responseParser.parseFeeEstimateResponse(r));
   }
 
   public async getEstimateFeeBulk(
     invocations: AccountInvocations,
-    { blockIdentifier = this.blockIdentifier, skipValidate = false }: getEstimateFeeBulkOptions
+    options: getEstimateFeeBulkOptions
   ) {
-    if (skipValidate) {
-      // eslint-disable-next-line no-console
-      console.warn('getEstimateFeeBulk RPC does not support skipValidate');
-    }
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_estimateFee', {
-      request: invocations.map((it) => this.buildTransaction(it, 'fee')),
-      block_id,
-    }).then(this.responseParser.parseFeeEstimateBulkResponse);
+    return this.channel
+      .getEstimateFee(invocations, options)
+      .then((r) => this.responseParser.parseFeeEstimateBulkResponse(r));
   }
 
   public async invokeFunction(
     functionInvocation: Invocation,
     details: InvocationsDetailsWithNonce
   ) {
-    return this.fetchEndpoint('starknet_addInvokeTransaction', {
-      invoke_transaction: {
-        sender_address: functionInvocation.contractAddress,
-        calldata: CallData.toHex(functionInvocation.calldata),
-        type: RPC.ETransactionType.INVOKE,
-        max_fee: toHex(details.maxFee || 0),
-        version: '0x1',
-        signature: signatureToHexArray(functionInvocation.signature),
-        nonce: toHex(details.nonce),
-      },
-    });
+    return this.channel.invoke(functionInvocation, details) as Promise<RPC.InvokedTransaction>;
   }
 
   public async declareContract(
-    { contract, signature, senderAddress, compiledClassHash }: DeclareContractTransaction,
+    transaction: DeclareContractTransaction,
     details: InvocationsDetailsWithNonce
   ) {
-    if (!isSierra(contract)) {
-      return this.fetchEndpoint('starknet_addDeclareTransaction', {
-        declare_transaction: {
-          type: RPC.ETransactionType.DECLARE,
-          contract_class: {
-            program: contract.program,
-            entry_points_by_type: contract.entry_points_by_type,
-            abi: contract.abi,
-          },
-          version: HEX_STR_TRANSACTION_VERSION_1,
-          max_fee: toHex(details.maxFee || 0),
-          signature: signatureToHexArray(signature),
-          sender_address: senderAddress,
-          nonce: toHex(details.nonce),
-        },
-      });
-    }
-    return this.fetchEndpoint('starknet_addDeclareTransaction', {
-      declare_transaction: {
-        type: RPC.ETransactionType.DECLARE,
-        contract_class: {
-          sierra_program: decompressProgram(contract.sierra_program),
-          contract_class_version: contract.contract_class_version,
-          entry_points_by_type: contract.entry_points_by_type,
-          abi: contract.abi,
-        },
-        compiled_class_hash: compiledClassHash || '',
-        version: HEX_STR_TRANSACTION_VERSION_2,
-        max_fee: toHex(details.maxFee || 0),
-        signature: signatureToHexArray(signature),
-        sender_address: senderAddress,
-        nonce: toHex(details.nonce),
-      },
-    });
+    return this.channel.declare(transaction, details) as Promise<RPC.DeclaredTransaction>;
   }
 
   public async deployAccountContract(
-    { classHash, constructorCalldata, addressSalt, signature }: DeployAccountContractTransaction,
+    transaction: DeployAccountContractTransaction,
     details: InvocationsDetailsWithNonce
   ) {
-    return this.fetchEndpoint('starknet_addDeployAccountTransaction', {
-      deploy_account_transaction: {
-        constructor_calldata: CallData.toHex(constructorCalldata || []),
-        class_hash: toHex(classHash),
-        contract_address_salt: toHex(addressSalt || 0),
-        type: RPC.ETransactionType.DEPLOY_ACCOUNT,
-        max_fee: toHex(details.maxFee || 0),
-        version: toHex(details.version || 0),
-        signature: signatureToHexArray(signature),
-        nonce: toHex(details.nonce),
-      },
-    });
+    return this.channel.deployAccount(
+      transaction,
+      details
+    ) as Promise<RPC.DeployedAccountTransaction>;
   }
 
-  public async callContract(call: Call, blockIdentifier: BlockIdentifier = this.blockIdentifier) {
-    const block_id = new Block(blockIdentifier).identifier;
-    const result = await this.fetchEndpoint('starknet_call', {
-      request: {
-        contract_address: call.contractAddress,
-        entry_point_selector: getSelectorFromName(call.entrypoint),
-        calldata: CallData.toHex(call.calldata),
-      },
-      block_id,
-    });
-
-    return this.responseParser.parseCallContractResponse(result);
+  public async callContract(call: Call, blockIdentifier?: BlockIdentifier) {
+    return this.channel.callContract(call, blockIdentifier);
   }
 
   /**
    * NEW: Estimate the fee for a message from L1
    * @param message Message From L1
    */
-  public async estimateMessageFee(
-    message: RPC.L1Message,
-    blockIdentifier: BlockIdentifier = this.blockIdentifier
-  ) {
-    const { from_address, to_address, entry_point_selector, payload } = message;
-    const formattedMessage = {
-      from_address: toHex(from_address),
-      to_address: toHex(to_address),
-      entry_point_selector: getSelector(entry_point_selector),
-      payload: getHexStringArray(payload),
-    };
-
-    const block_id = new Block(blockIdentifier).identifier;
-    return this.fetchEndpoint('starknet_estimateMessageFee', {
-      message: formattedMessage,
-      block_id,
-    });
+  public async estimateMessageFee(message: RPC.L1Message, blockIdentifier?: BlockIdentifier) {
+    return this.channel.estimateMessageFee(message, blockIdentifier);
   }
 
   /**
@@ -710,7 +465,7 @@ export class RpcProvider implements ProviderInterface {
    * @returns Object with the stats data
    */
   public async getSyncingStats() {
-    return this.fetchEndpoint('starknet_syncing');
+    return this.channel.getSyncingStats();
   }
 
   /**
@@ -718,76 +473,162 @@ export class RpcProvider implements ProviderInterface {
    * @returns events and the pagination of the events
    */
   public async getEvents(eventFilter: RPC.EventFilter) {
-    return this.fetchEndpoint('starknet_getEvents', { filter: eventFilter });
+    return this.channel.getEvents(eventFilter);
   }
 
   /**
-   * StarknetId Endpoint (get name from address)
+   * Verify in Starknet a signature of a TypedData object or of a given hash.
+   * @param {BigNumberish | TypedData} message TypedData object to be verified, or message hash to be verified.
+   * @param {Signature} signature signature of the message.
+   * @param {BigNumberish} accountAddress address of the account that has signed the message.
+   * @param {string} [signatureVerificationFunctionName] if account contract with non standard account verification function name.
+   * @param { okResponse: string[]; nokResponse: string[]; error: string[] } [signatureVerificationResponse] if account contract with non standard response of verification function.
+   * @returns
+   * ```typescript
+   * const myTypedMessage: TypedMessage = .... ;
+   * const messageHash = typedData.getMessageHash(myTypedMessage,accountAddress);
+   * const sign: WeierstrassSignatureType = ec.starkCurve.sign(messageHash, privateKey);
+   * const accountAddress = "0x43b7240d227aa2fb8434350b3321c40ac1b88c7067982549e7609870621b535";
+   * const result1 = myRpcProvider.verifyMessageInStarknet(myTypedMessage, sign, accountAddress);
+   * const result2 = myRpcProvider.verifyMessageInStarknet(messageHash, sign, accountAddress);
+   * // result1 = result2 = true
+   * ```
    */
-  public async getStarkName(address: BigNumberish, StarknetIdContract?: string) {
-    return getStarkName(this, address, StarknetIdContract);
-  }
-
-  /**
-   * StarknetId Endpoint (get address from name)
-   */
-  public async getAddressFromStarkName(name: string, StarknetIdContract?: string) {
-    return getAddressFromStarkName(this, name, StarknetIdContract);
-  }
-
-  public buildTransaction(
-    invocation: AccountInvocationItem,
-    versionType?: 'fee' | 'transaction'
-  ): RPC.BaseTransaction {
-    const defaultVersions = getVersionsByType(versionType);
-    const details = {
-      signature: signatureToHexArray(invocation.signature),
-      nonce: toHex(invocation.nonce),
-      max_fee: toHex(invocation.maxFee || 0),
+  public async verifyMessageInStarknet(
+    message: BigNumberish | TypedData,
+    signature: Signature,
+    accountAddress: BigNumberish,
+    signatureVerificationFunctionName?: string,
+    signatureVerificationResponse?: { okResponse: string[]; nokResponse: string[]; error: string[] }
+  ): Promise<boolean> {
+    const isTypedData = validateTypedData(message);
+    if (!isBigNumberish(message) && !isTypedData) {
+      throw new Error('message has a wrong format.');
+    }
+    if (!isBigNumberish(accountAddress)) {
+      throw new Error('accountAddress shall be a BigNumberish');
+    }
+    const messageHash = isTypedData ? getMessageHash(message, accountAddress) : toHex(message);
+    // HOTFIX: Accounts should conform to SNIP-6
+    // (https://github.com/starknet-io/SNIPs/blob/f6998f779ee2157d5e1dea36042b08062093b3c5/SNIPS/snip-6.md?plain=1#L61),
+    // but they don't always conform. Also, the SNIP doesn't standardize the response if the signature isn't valid.
+    const knownSigVerificationFName = signatureVerificationFunctionName
+      ? [signatureVerificationFunctionName]
+      : ['isValidSignature', 'is_valid_signature'];
+    const knownSignatureResponse = signatureVerificationResponse || {
+      okResponse: [
+        // any non-nok response is true
+      ],
+      nokResponse: [
+        '0x0', // Devnet
+        '0x00', // OpenZeppelin 0.7.0 to 0.9.0 invalid signature
+      ],
+      error: [
+        'argent/invalid-signature', // ArgentX 0.3.0 to 0.3.1
+        'is invalid, with respect to the public key', // OpenZeppelin until 0.6.1, Braavos 0.0.11
+        'INVALID_SIG', // Braavos 1.0.0
+      ],
     };
+    let error: any;
 
-    if (invocation.type === TransactionType.INVOKE) {
-      return {
-        type: RPC.ETransactionType.INVOKE, // Diff between sequencer and rpc invoke type
-        sender_address: invocation.contractAddress,
-        calldata: CallData.toHex(invocation.calldata),
-        version: toHex(invocation.version || defaultVersions.v1),
-        ...details,
-      };
-    }
-    if (invocation.type === TransactionType.DECLARE) {
-      if (!isSierra(invocation.contract)) {
-        return {
-          type: invocation.type,
-          contract_class: invocation.contract,
-          sender_address: invocation.senderAddress,
-          version: toHex(invocation.version || defaultVersions.v1),
-          ...details,
-        };
+    // eslint-disable-next-line no-restricted-syntax
+    for (const SigVerificationFName of knownSigVerificationFName) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const resp = await this.callContract({
+          contractAddress: toHex(accountAddress),
+          entrypoint: SigVerificationFName,
+          calldata: CallData.compile({
+            hash: toBigInt(messageHash).toString(),
+            signature: formatSignature(signature),
+          }),
+        });
+        // Response NOK Signature
+        if (knownSignatureResponse.nokResponse.includes(resp[0].toString())) {
+          return false;
+        }
+        // Response OK Signature
+        // Empty okResponse assume all non-nok responses are valid signatures
+        // OpenZeppelin 0.7.0 to 0.9.0, ArgentX 0.3.0 to 0.3.1 & Braavos Cairo 0.0.11 to 1.0.0 valid signature
+        if (
+          knownSignatureResponse.okResponse.length === 0 ||
+          knownSignatureResponse.okResponse.includes(resp[0].toString())
+        ) {
+          return true;
+        }
+        throw Error('signatureVerificationResponse Error: response is not part of known responses');
+      } catch (err) {
+        // Known NOK Errors
+        if (
+          knownSignatureResponse.error.some((errMessage) =>
+            (err as Error).message.includes(errMessage)
+          )
+        ) {
+          return false;
+        }
+        // Unknown Error
+        error = err;
       }
-      return {
-        // compiled_class_hash
-        type: invocation.type,
-        contract_class: {
-          ...invocation.contract,
-          sierra_program: decompressProgram(invocation.contract.sierra_program),
-        },
-        compiled_class_hash: invocation.compiledClassHash || '',
-        sender_address: invocation.senderAddress,
-        version: toHex(invocation.version || defaultVersions.v2),
-        ...details,
-      };
     }
-    if (invocation.type === TransactionType.DEPLOY_ACCOUNT) {
-      return {
-        type: invocation.type,
-        constructor_calldata: CallData.toHex(invocation.constructorCalldata || []),
-        class_hash: toHex(invocation.classHash),
-        contract_address_salt: toHex(invocation.addressSalt || 0),
-        version: toHex(invocation.version || defaultVersions.v1),
-        ...details,
-      };
+
+    throw Error(`Signature verification Error: ${error}`);
+  }
+
+  /**
+   * Test if class is already declared from ContractClassIdentifier
+   * Helper method using getClass
+   * @param ContractClassIdentifier
+   * @param blockIdentifier
+   */
+  public async isClassDeclared(
+    contractClassIdentifier: ContractClassIdentifier,
+    blockIdentifier?: BlockIdentifier
+  ) {
+    let classHash: string;
+    if (!contractClassIdentifier.classHash && 'contract' in contractClassIdentifier) {
+      const hashes = extractContractHashes(contractClassIdentifier);
+      classHash = hashes.classHash;
+    } else if (contractClassIdentifier.classHash) {
+      classHash = contractClassIdentifier.classHash;
+    } else {
+      throw Error('contractClassIdentifier type not satisfied');
     }
-    throw Error('RPC buildTransaction received unknown TransactionType');
+
+    try {
+      const result = await this.getClass(classHash, blockIdentifier);
+      return result instanceof Object;
+    } catch (error) {
+      if (error instanceof LibraryError) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Build bulk invocations with auto-detect declared class
+   * 1. Test if class is declared if not declare it preventing already declared class error and not declared class errors
+   * 2. Order declarations first
+   * @param invocations
+   */
+  public async prepareInvocations(invocations: Invocations) {
+    const bulk: Invocations = [];
+    // Build new ordered array
+    // eslint-disable-next-line no-restricted-syntax
+    for (const invocation of invocations) {
+      if (invocation.type === TransactionType.DECLARE) {
+        // Test if already declared
+        // eslint-disable-next-line no-await-in-loop
+        const isDeclared = await this.isClassDeclared(
+          'payload' in invocation ? invocation.payload : invocation
+        );
+        if (!isDeclared) {
+          bulk.unshift(invocation);
+        }
+      } else {
+        bulk.push(invocation);
+      }
+    }
+    return bulk;
   }
 }

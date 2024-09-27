@@ -1,7 +1,5 @@
 import * as starkCurve from '@scure/starknet';
-
 import { constants, ec, hash, num, stark } from '../../src';
-import { Block } from '../../src/provider/utils';
 
 const { IS_BROWSER } = constants;
 
@@ -50,6 +48,7 @@ describe('getSelectorFromName()', () => {
     );
   });
 });
+
 describe('computeHashOnElements()', () => {
   test('should return valid hash for empty array', () => {
     const res = hash.computeHashOnElements([]);
@@ -68,13 +67,14 @@ describe('computeHashOnElements()', () => {
     );
   });
 });
+
 describe('estimatedFeeToMaxFee()', () => {
   test('should return maxFee for 0', () => {
-    const res = stark.estimatedFeeToMaxFee(0, 0.15);
+    const res = stark.estimatedFeeToMaxFee(0, 15);
     expect(res).toBe(0n);
   });
   test('should return maxFee for 10_000', () => {
-    const res = stark.estimatedFeeToMaxFee(10_000, 0.15);
+    const res = stark.estimatedFeeToMaxFee(10_000, 15);
     expect(res).toBe(11500n);
   });
 });
@@ -113,21 +113,5 @@ describe('calculateContractAddressFromHash()', () => {
     expect(starkCurveSpy).toHaveBeenCalled();
     expect(BigInt(res)).toBeLessThan(constants.ADDR_BOUND);
     starkCurveSpy.mockRestore();
-  });
-});
-
-describe('new Block()', () => {
-  test('Block identifier and queryIdentifier', () => {
-    const blockA = new Block(0);
-    expect(blockA.identifier).toMatchObject({ block_number: 0 });
-    expect(blockA.queryIdentifier).toBe('blockNumber=0');
-
-    const blockB = new Block('latest');
-    expect(blockB.identifier).toBe('latest');
-    expect(blockB.queryIdentifier).toBe('blockNumber=latest');
-
-    const blockC = new Block('0x01');
-    expect(blockC.identifier).toMatchObject({ block_hash: '0x01' });
-    expect(blockC.queryIdentifier).toBe('blockHash=0x01');
   });
 });
